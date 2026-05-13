@@ -1,0 +1,330 @@
+---
+title: "Pipeline reproduzível para cálculo da Taxa de Chefia"
+subtitle: "Tratamento e tratamento dos dados da Pesquisa Distrital por Amostra de Domicílios Ampliada - 2024"
+author: "Phillippi Willian"
+date: today
+format:
+  html:
+    toc: true
+    toc-title: "Nesta página"
+    toc-depth: 3
+    css: styles.css
+---
+
+<!-- badges: start -->
+
+[![Status](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
+
+
+<!-- badges: end -->
+
+## Visão Geral
+
+Este script apresenta um fluxo de trabalho reproduzível para o cálculo da taxa de chefia.
+
+## Fonte de dados
+
+Os dados utilizados neste script são provenientes da Pesquisa Distrital por Amostra de Domicílios Ampliada - 2024.
+
+## Metodologia
+
+A metodologia usada foi extraída do relatório "Déficit e Demanda Habitacional do Distrito Federal - 2021", disponível no site do Instituto de Pesquisa Econômica Aplicada (IPEA) [aqui](https://www.ipe.df.gov.br/deficit-e-demanda-habitacional-do-distrito-federal-2021).
+
+O foco são pessoas de 24 a 64 anos, usando 3 grupos etários: 24-29, 30-39 e 40-64 anos. A taxa de chefia é calculada como a proporção de pessoas chefes de domicílio em relação ao total de pessoas em cada grupo etário:
+
+$$
+\text{Taxa de Chefia}_{i} = \frac{\text{Chefes de Domicílio}_{i}}{\text{Total de Pessoas}_{i}}
+$$
+
+Onde $i$ representa os grupos etários: 24-29, 30-39 e 40-64 anos.
+
+## Código em R
+
+### Carregar pacotes
+
+```{r}
+#| label: pacotes
+#| warning: false
+#| output: false
+ 
+# Verifica se o pacman está instalado. Caso não esteja, instala o pacote.
+if (!require("pacman")) install.packages("pacman")
+
+# Carrega todos os pacotes
+pacman::p_load(
+  tidyverse,  # Pacote para manipulação de dados
+  readxl,     # Pacote para leitura de arquivos .xls e .xlsx
+  lubridate,  # Pacote para manipulação de datas
+  data.table, # Pacote para manipulação de dados
+  survey,     # Pacote para manipulação de dados survey
+  srvyr       # Pacote que ajusta a família tidyverse para dados survey     
+  ) 
+   
+```
+
+### Download dos Dados
+
+Primeiro, é feito o download dos dados em formato .zip. A função baixar_dados_zipados é responsável por baixar o arquivo, extrair o conteúdo e identificar se ele está em .csv ou .xlsx. Como a base de moradores está em .xlsx e a de domicílios em .csv, a função é capaz de ler ambos os formatos de forma dinâmica. Por fim, ela retorna um dataframe para cada base de dados.
+
+```{r}
+#| label: download
+#| output: false
+
+baixar_dados <- function(url) {
+  
+  # 1. Definir arquivos e pastas temporárias
+  temp_zip <- tempfile(fileext = ".zip")
+  pasta_temp <- tempdir()
+  
+  # 2. Baixar o arquivo .zip
+  tryCatch({
+    download.file(url, temp_zip, mode = "wb", quiet = TRUE)
+  }, error = function(e) {
+    stop("Erro ao baixar o arquivo. Verifique sua conexão ou a validade da URL.\nDetalhes: ", e$message)
+  })
+  
+  # 3. Listar o que tem dentro do zip
+  arquivos_no_zip <- unzip(temp_zip, list = TRUE)$Name
+  
+  # 4. Buscar por qualquer arquivo que termine em .csv ou .xlsx
+  arquivos_alvo <- arquivos_no_zip[grepl("\\.(csv|xlsx)$", arquivos_no_zip, ignore.case = TRUE)]
+  
+  # Verificações de segurança
+  if (length(arquivos_alvo) == 0) {
+    unlink(temp_zip)
+    stop("Nenhum arquivo .csv ou .xlsx foi encontrado dentro do .zip.")
+  } else if (length(arquivos_alvo) > 1) {
+    warning("Mais de um arquivo de dados encontrado no .zip. Lendo apenas o primeiro: ", arquivos_alvo[1])
+  }
+  
+  nome_arquivo <- arquivos_alvo[1]
+  
+  # 5. Extrair o arquivo encontrado para a pasta temporária
+  unzip(temp_zip, files = nome_arquivo, exdir = pasta_temp)
+  caminho_extraido <- file.path(pasta_temp, nome_arquivo)
+  
+  # 6. Identificar a extensão para escolher a função de leitura correta
+  extensao <- tolower(tools::file_ext(nome_arquivo))
+  
+  if (extensao == "csv") {
+    message("Lendo arquivo CSV...")
+    dados <- readr::read_csv2(caminho_extraido)
+  } else if (extensao == "xlsx") {
+    message("Lendo arquivo Excel...")
+    dados <- readxl::read_excel(caminho_extraido)
+  }
+  
+  # 7. Limpeza dos arquivos temporários
+  unlink(temp_zip)
+  unlink(caminho_extraido)
+  
+  # 8. Retornar o dataframe
+  return(dados)
+}
+
+# Dados Domicílios
+pdad_dom_2024 <- baixar_dados("https://pdad.ipe.df.gov.br/files/reports/domicilios.zip")
+
+# Dados Moradores
+pdad_mor_2024 <- baixar_dados("https://pdad.ipe.df.gov.br/files/reports/moradores.zip")
+
+```
+
+### Tratamento de Dados
+
+Na etapa seguinte, realizamos a unificação das bases de domicílios e moradores. O cruzamento é feito utilizando as variáveis localidade, A01nficha e setor_distrito como chaves de identificação. Em seguida, os códigos numéricos originais da variável localidade são recodificados para criar a variável RA_nome.
+
+```{r}
+#| label: tratamento
+#| output: false
+
+# Fazer a junção das bases de moradores e domicílios
+pdad_2024 <- pdad_dom_2024 %>%
+  # Trazer as informações de pessoas para domicílios
+  dplyr::left_join(
+    pdad_mor_2024,
+    by = c(
+      "localidade"     = "localidade",
+      "A01nficha" = "A01nficha",
+      "setor_distrito"  = "setor_distrito"
+    )
+  ) %>%
+  # Ajustar o nome das RAs
+  dplyr::mutate(
+    RA_nome = factor(
+      case_when(
+        localidade == 5301 ~ 'Plano Piloto',
+        localidade == 5302 ~ 'Gama',
+        localidade == 5303 ~ 'Taguatinga',
+        localidade == 5304 ~ 'Brazlândia',
+        localidade == 5305 ~ 'Sobradinho',
+        localidade == 5306 ~ 'Planaltina',
+        localidade == 5307 ~ 'Paranoá',
+        localidade == 5308 ~ 'Núcleo Bandeirante',
+        localidade == 5309 ~ 'Ceilândia',
+        localidade == 5310 ~ 'Guará',
+        localidade == 5311 ~ 'Cruzeiro',
+        localidade == 5312 ~ 'Samambaia',
+        localidade == 5313 ~ 'Santa Maria',
+        localidade == 5314 ~ 'São Sebastião',
+        localidade == 5315 ~ 'Recanto Das Emas',
+        localidade == 5316 ~ 'Lago Sul',
+        localidade == 5317 ~ 'Riacho Fundo',
+        localidade == 5318 ~ 'Lago Norte',
+        localidade == 5319 ~ 'Candangolândia',
+        localidade == 5320 ~ 'Águas Claras',
+        localidade == 5321 ~ 'Riacho Fundo II',
+        localidade == 5322 ~ 'Sudoeste e Octogonal',
+        localidade == 5323 ~ 'Varjão',
+        localidade == 5324 ~ 'Park Way',
+        localidade == 5325 ~ 'SCIA',
+        localidade == 5326 ~ 'Sobradinho II',
+        localidade == 5327 ~ 'Jardim Botânico',
+        localidade == 5328 ~ 'Itapoã',
+        localidade == 5329 ~ 'SIA',
+        localidade == 5330 ~ 'Vicente Pires',
+        localidade == 5331 ~ 'Fercal',
+        localidade == 5332 ~ 'Sol Nascente / Pôr do Sol',
+        localidade == 5333 ~ 'Arniqueira',
+        localidade == 5334 ~ 'Arapoanga',
+        localidade == 5335 ~ 'Água Quente',
+        localidade == 5336 ~ 'Área Rural',
+        localidade == 5241 ~ 'Águas Lindas de Goiás',
+        localidade == 5242 ~ 'Alexânia',
+        localidade == 5243 ~ 'Cidade Ocidental',
+        localidade == 5244 ~ 'Cristalina',
+        localidade == 5245 ~ 'Cocalzinho de Goiás',
+        localidade == 5246 ~ 'Formosa',
+        localidade == 5247 ~ 'Luziânia',
+        localidade == 5248 ~ 'Novo Gama',
+        localidade == 5249 ~ 'Padre Bernardo',
+        localidade == 5250 ~ 'Planaltina de Goiás',
+        localidade == 5251 ~ 'Santo Antônio do Descoberto',
+        localidade == 5252 ~ 'Valparaíso de Goiás'
+      )
+    )
+  )
+
+
+# Excluir as bases parciais
+rm(pdad_dom_2024, pdad_mor_2024)
+```
+
+### Expansão da amostra
+
+Nesta etapa, configuramos o desenho amostral da pesquisa para garantir que as estimativas representem corretamente a população. Primeiro, utilizamos a função svydesign do pacote survey para declarar a estrutura da amostra, definindo a ficha (A01nficha) como a unidade primária, o setor (setor_distrito) como estrato e o peso_mor como fator de expansão. Em seguida, convertemos esse objeto estatístico clássico para o formato de tibble através da função as_survey do pacote srvyr.
+
+```{r}
+#| label: expansao
+#| output: false
+
+# Declarar o desenho incial
+sample_pdad <- 
+  survey::svydesign(id      = ~A01nficha,        # Identificador único da unidade amostrada
+                    strata  = ~setor_distrito,   # Identificação do estrato
+                    weights = ~peso_mor,         # Inverso da fração amostral
+                    nest    = TRUE,              # Parâmetro de tratamento para os IDs dos estratos
+                    data    = pdad_2024          # Declarar a base a ser utilizada
+  )
+
+# Ajustar objeto de amostra, para uso com o pacote srvyr (como tibble)
+amostra_mor <- srvyr::as_survey(sample_pdad)
+
+```
+
+### Resultados e inferências
+
+Primeiro é calculada a taxa de chefia por grupo etário, utilizando a variável idade_calculada para criar os grupos etários (24-29, 30-39 e 40-64 anos). Em seguida, é feita uma filtragem para considerar apenas os chefes de domicílio (E04==1) e o total de chefes é calculado para cada grupo etário.
+
+```{r}
+#| label: taxa-chefia-idade
+#| output: false
+
+
+# Calcular a taxa de chefia por grupo etário.
+tx_chefia <- amostra_mor %>% 
+  srvyr::mutate(grupo_etario = case_when(idade_calculada %in% c(24:29) ~ "idade_24_29",
+                                         idade_calculada %in% c(30:39) ~ "idade_30_39",
+                                         idade_calculada %in% c(40:64) ~ "idade_40_64")) %>% 
+  srvyr::filter(E04==1) %>% 
+  srvyr::group_by(grupo_etario) %>% 
+  srvyr::summarise(total_chefes=survey_total(vartype = c("cv", "ci")))
+
+tx_chefia <- subset(tx_chefia, !is.na(grupo_etario))
+
+# Calcular o total de pessoas na população.
+pop_total <- amostra_mor %>%
+  srvyr::mutate(
+    grupo_etario = case_when(
+      idade_calculada %in% c(24:29) ~ "idade_24_29",
+      idade_calculada %in% c(30:39) ~ "idade_30_39",
+      idade_calculada %in% c(40:64) ~ "idade_40_64"
+    )
+  ) %>%
+  srvyr::group_by(grupo_etario) %>%
+  srvyr::summarise(pop_total = survey_total(vartype = c("cv", "ci")))
+
+pop_total <- subset(pop_total,!is.na(grupo_etario))
+
+# Juntar as tabelas para calcular a taxa de chefia por idade.
+tx_chefia_idade <- cbind(tx_chefia, pop_total[, -1])
+
+tx_chefia_idade$tx_chefia <- tx_chefia_idade$total_chefes / tx_chefia_idade$pop_total
+
+# Teste para ver se é possível fazer inferência sobre os dados.
+# Necessário coeficiente de variação (cv) menor do que 25%
+tx_chefia_idade <- as.data.frame(tx_chefia_idade)
+
+tx_chefia_idade$tx_chefia <-
+  ifelse(tx_chefia_idade$total_chefes_cv > 0.25,
+         NA,
+         tx_chefia_idade$tx_chefia)
+
+rm(tx_chefia, pop_total)
+```
+
+Após o cálculo da taxa de chefia por grupo etário, o mesmo processo é repetido para calcular a taxa de chefia por grupo etário e região administrativa (RA). A variável RA_nome é utilizada para identificar as RAs, e a taxa de chefia é calculada para cada combinação de grupo etário e RA.
+```{r}
+#| label: taxa-chefia-idade-ra
+#| output: false
+
+  # Cálculo a taxa de chefia por idade e RA.
+tx_chefia_idade_ra <- amostra_mor %>% 
+  srvyr::mutate(grupo_etario = case_when(idade_calculada %in% c(24:29) ~ "idade_24_29",
+                                         idade_calculada %in% c(30:39) ~ "idade_30_39",
+                                         idade_calculada %in% c(40:64) ~ "idade_40_64")) %>% 
+  srvyr::filter(E05==1) %>% 
+  srvyr::group_by(grupo_etario, localidade) %>% 
+  srvyr::summarise(total_chefes=survey_total(vartype = c("cv", "ci")))
+
+tx_chefia_idade_ra <- subset(tx_chefia_idade_ra, !is.na(grupo_etario))
+
+pop_idade_ra <- amostra_mor %>% 
+  srvyr::mutate(grupo_etario = case_when(idade_calculada %in% c(24:29) ~ "idade_24_29",
+                                         idade_calculada %in% c(30:39) ~ "idade_30_39",
+                                         idade_calculada %in% c(40:64) ~ "idade_40_64")) %>% 
+  srvyr::group_by(grupo_etario, localidade) %>% 
+  srvyr::summarise(pop_total=survey_total(vartype = c("cv", "ci")))
+
+pop_idade_ra <- subset(pop_idade_ra, !is.na(grupo_etario))
+
+tx_chefia_idade_raf <-
+  cbind(tx_chefia_idade_ra, pop_idade_ra[, -c(1, 2)])
+
+tx_chefia_idade_raf$tx_chefia <-
+  tx_chefia_idade_raf$total_chefes / tx_chefia_idade_raf$pop_total
+
+tx_chefia_idade_raf <-
+  subset(tx_chefia_idade_raf,!is.na(grupo_etario))
+
+  # Teste para ver se inferências podem ser feitas 
+tx_chefia_idade_raf <- as.data.frame(tx_chefia_idade_raf)
+
+tx_chefia_idade_raf$tx_chefia <-
+  ifelse(tx_chefia_idade_raf$total_chefes_cv > 0.25,
+         NA,
+         tx_chefia_idade_raf$tx_chefia)
+
+```
+
+
