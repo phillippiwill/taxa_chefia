@@ -1,0 +1,26 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  navbar:
+    background: "#E7EAF6"
+    right:
+      - icon: github
+        href: https://github.com/phillippiwill/taxa_chefia
+        aria-label: GitHub
+
+      - icon: globe-americas
+        href: https://www.ipe.df.gov.br/deficit-e-demanda-habitacional-do-distrito-federal-2021
+        aria-label: Déficit e Demanda Habitacional do Distrito Federal - 2021
+
+format:
+  html:
+    theme:
+      - cosmo
+      - brand
+    css: styles.css
+    toc: true
+    embed-resources: true
+
+editor: visual
